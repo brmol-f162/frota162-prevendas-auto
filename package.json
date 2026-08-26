@@ -1,0 +1,13 @@
+{
+  "name": "frota162-prevendas-auto",
+  "version": "1.0.0",
+  "description": "Autogestão semanal de pré-vendas Frota162 — captura via webhook Salesbud, pontua com Claude, publica no Drive e Slack.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "googleapis": "^140.0.0"
+  }
+}
