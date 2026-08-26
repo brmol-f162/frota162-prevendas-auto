@@ -35,12 +35,12 @@ const PRE_VENDAS_SLACK_ID = {
 };
 
 const PRE_VENDAS_FOLDER_ID = {
-  'Carlos': '13PYMdyvXj7h5twMrRG_4LwyIsyrTtBM5',
-  'Vitor': '1IT7uen8q6PHvRwsI1RvOBWAwvsVs-lu6',
-  'Juliana': '1Zq2IJivGhnAESFaAFFqgFDOejaj8SIGx',
-  'Iquiara': '1yFzkkw0tnEOgPEUvOGYpxgbv4qHYtRKQ',
-  'Karina': '1OXFKq6tR3iEECD47A365ThnJx6p1GswC',
-  'Vinícius': '1bwB-dQEy0SjqsjeEgbWL0XBsEFjF3X3k',
+  'Carlos': '1f5Xk-5mVNye_mAWve0vkj26F0v5CWzPG',
+  'Vitor': '1w63BZqmLWx9_BKRpppd3aGoPg5lxvzRc',
+  'Juliana': '1EDSUfxOkozhLTdzNr6PVxVQJzz8W66BC',
+  'Iquiara': '1jiGndNA2X_y12H4HUA9xEWh0OU_vtbZs',
+  'Karina': '19h7KFzksawKy_ZikLrCjMvU4q2UGMv9A',
+  'Vinícius': '12CvXLW91blbuxgp-j2uQdZW8DU9aNiCC',
 };
 
 const RUBRIC_OUTBOUND = ['Abertura', 'Qualificação', 'Objeção', 'Próximo Passo'];
