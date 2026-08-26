@@ -456,7 +456,7 @@ app.post('/cron/pre-vendas-semanal', (req, res) => {
         });
         await drive.permissions.create({ fileId: uploaded.data.id, supportsAllDrives: true, requestBody: { role: 'writer', type: 'anyone' } });
 
-        mencoes.push(`• <@${PRE_VENDAS_SLACK_ID[nome]}> ${nome}: <${uploaded.data.webViewLink}|relatório>`);
+        mencoes.push(`• <@${PRE_VENDAS_SLACK_ID[nome]}> ${nome}: <https://drive.google.com/drive/folders/${PRE_VENDAS_FOLDER_ID[nome]}|pasta>`);
       }
 
       await postSlack(`📊 *Autogestão Pré-Vendas — ciclo automático (${inicioISO}–${fimISO})*\n\n${mencoes.join('\n')}\n\n_Gerado automaticamente. Verifique com atenção nas primeiras semanas._`);
