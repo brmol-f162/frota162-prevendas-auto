@@ -1,475 +1,391 @@
-const crypto = require('crypto');
-const express = require('express');
-const { google } = require('googleapis');
-const https = require('https');
+// frota162-prevendas-v2/server.js
+//
+// Substitui a automação antiga (webhook Salesbud -> planilha -> HTML por pessoa).
+// Modelo novo: pull semanal via API REST da Salesbud (OAuth2 client_credentials),
+// scoring com o rubric já validado (outbound.md / inbound.md do skill pre-vendas-coach),
+// entrega 1 resumo executivo por Slack DM pro Bruno, toda quarta de manhã.
+//
+// Time analisado (Carlos NÃO entra — saiu da empresa):
+//   Outbound: Vitor, Juliana, Iquiara
+//   Inbound:  Karina, Vinícius
+//
+// Janela: sempre os 7 dias fechados anteriores ao dia em que o cron roda
+// (se roda quarta, pega quarta 00:00 -> terça 23:59 da semana anterior).
 
+const express = require("express");
 const app = express();
-app.use(express.text({ type: '*/*', limit: '50mb' }));
-app.use(express.json({ limit: '50mb' }));
+app.use(express.json());
 
-// ═══════════════════════════════════════════════════════════════════════
-// Frota162 — Autogestão Pré-Vendas (repositório isolado)
-// Webhook Salesbud (Ligação + WhatsApp) → captura crua no Sheets →
-// cron semanal agrega, pontua com Claude (rubric próprio, NUNCA usa
-// analytics.score da Salesbud) → HTML por canal + consolidado → Drive + Slack.
-// ═══════════════════════════════════════════════════════════════════════
+// ---------------------------------------------------------------------------
+// CONFIG
+// ---------------------------------------------------------------------------
 
-// ─── Config fixa ─────────────────────────────────────────────────────
-const PRE_VENDAS_USER_MAP = {
-  '15368': 'Carlos',
-  '15365': 'Vitor',
-  '15366': 'Juliana',
-  '15367': 'Iquiara',
-  '15363': 'Karina',
-  '15364': 'Vinícius',
-};
+const SALESBUD_CLIENT_ID = process.env.SALESBUD_CLIENT_ID;
+const SALESBUD_CLIENT_SECRET = process.env.SALESBUD_CLIENT_SECRET;
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const SLACK_WEBHOOK_URL = process.env.PV_SLACK_DM_WEBHOOK_URL; // webhook novo, apontado pra DM do Bruno (não o canal antigo)
+const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-sonnet-4-6";
+const TIMEZONE = "America/Sao_Paulo";
 
-const PRE_VENDAS_PERFIL = {
-  'Carlos': 'Outbound', 'Vitor': 'Outbound', 'Juliana': 'Outbound', 'Iquiara': 'Outbound',
-  'Karina': 'Inbound', 'Vinícius': 'Inbound',
-};
+const REPS = [
+  { name: "Vitor Campos", email: "vitor.campos@frota162.com.br", team: "Outbound" },
+  { name: "Juliana Romaris", email: "juliana.romaris@frota162.com.br", team: "Outbound" },
+  { name: "Iquiara Machado", email: "iquiara@frota162.com.br", team: "Outbound" },
+  { name: "Karina Pimenta", email: "karina@frota162.com.br", team: "Inbound" },
+  { name: "Vinícius Martins", email: "vinicius.cardoso@frota162.com.br", team: "Inbound" },
+];
 
-const PRE_VENDAS_SLACK_ID = {
-  'Carlos': 'U0ACERPFPAM', 'Vitor': 'U09RYFBB1BL', 'Juliana': 'U0B2C02PS4S',
-  'Iquiara': 'U0B3688EV40', 'Karina': 'U09MUR9SRSM', 'Vinícius': 'U09AD7LPYC9',
-};
+// Rubric embutido literalmente — fonte: /mnt/skills/user/pre-vendas-coach/references/*.md
+// Não reduzir/parafrasear: o texto exato é o que o Claude usa pra pontuar.
 
-const PRE_VENDAS_FOLDER_ID = {
-  'Carlos': '1yD8DPb2uQGqcft7u_9e7IYOPOL5fFtkv',
-  'Vitor': '1MKGQ0ubIH6OWNfUgf5IOogU2Ez_mxz_4',
-  'Juliana': '1UPw-CFW3YWasXvuyvCyFF-VYU6xlkexv',
-  'Iquiara': '1Jc2vOxtOub5HvCQ7B7-_JNtq75lvTE2g',
-  'Karina': '1QnNnaxjlAmHAevdA0j_Rr-793QF4wimm',
-  'Vinícius': '1riShFbpMIEHZnQ2tcq7onIEzYE7CKHNn',
-};
+const OUTBOUND_RUBRIC = `
+PERFIL: Outbound — Pré-Vendas
+SDR liga proativamente para leads frios/base fria. Objetivo da call: qualificar e
+agendar reunião com o AE (Especialista).
 
-const RUBRIC_OUTBOUND = ['Abertura', 'Qualificação', 'Objeção', 'Próximo Passo'];
-const RUBRIC_INBOUND = ['Abertura e Contexto', 'Qualificação de Frota', 'Qualificação da Dor', 'Decisor', 'Fechamento com Escassez'];
+DIMENSÕES DE NOTA (ligações efetivas) — escala 1 a 5 (5 = melhor, 1 = reservado
+pra casos muito fracos):
 
-const EVENTOS_ABA = 'Eventos';
-const MARCADORES_ABA = 'Marcadores'; // substitui os arquivos .marker no Drive do outro pipeline
+1. Abertura — Chegou no decisor certo e ganhou atenção real nos primeiros
+   segundos, sem soar script.
+2. Qualificação — Levantou processo atual, quantidade/valor de multa e placas
+   antes de propor qualquer coisa.
+3. Objeção — Respondeu preço/concorrente/"sem interesse" sem desistir na
+   primeira barreira, aplicando o protocolo de concorrente quando cabível.
+4. Próximo Passo — Saiu da call com algo concreto: reunião marcada,
+   desqualificação justificada, ou dia/hora certos de retomada.
 
-// ─── Clientes Google ─────────────────────────────────────────────────
-function getDriveClient() {
-  const auth = new google.auth.GoogleAuth({
-    credentials: JSON.parse(process.env.GOOGLE_CREDENTIALS),
-    scopes: ['https://www.googleapis.com/auth/drive'],
+REGRA DE DESQUALIFICAÇÃO A REAVALIAR:
+- Corte de placas: raro no Outbound (listas já vêm com volume maior) — só marcar
+  se aparecer explicitamente.
+- Corte de multa: <5 multas/mês ou <R$1.000/mês.
+- Classificar desqualificação como: "correta", "estrutural" (ex: Locadora) ou
+  "oportunidade não confirmada" (desqualificou sem confirmar o número).
+
+Para cada call, classifique em uma categoria:
+- "Agendamento confirmado" (marcou reunião)
+- "Qualificado sem próximo passo" (qualificou bem mas não fechou data/hora de
+  retomada — isso é sempre prioridade na análise, nunca detalhe secundário)
+- "Desqualificação" (aplicar a regra acima)
+- "Outro" (call curta, engano, não se aplica rubric)
+`.trim();
+
+const INBOUND_RUBRIC = `
+PERFIL: Inbound — Pré-Vendas
+Lead chegou por conta própria (site, redes sociais, WhatsApp) e demonstrou
+interesse. SDR não está "abrindo porta fria" — está confirmando fit e agendando.
+
+QUALIFICAÇÃO QUE PRECISA APARECER NA CALL (playbook oficial):
+segmento da empresa, tipo de frota (própria/mista/terceirizada), volume médio
+mensal de multas, frota PJ ou PF, quantidade de placas, perfil de quem fala
+(Decisor / Influenciador forte / fraco), motivo do contato, se já usa solução
+(concorrente), estados de atuação, aderência ao SNE.
+
+SCRIPT OFICIAL (8 passos) — usar pra mapear onde a call quebrou:
+1. Abertura (quebra-gelo e contexto)
+2. Contexto geral (segmento e tipo de frota)
+3. Tamanho e perfil da frota (placas, PJ/PF)
+4. Dor (controle de multas hoje, volume médio mensal)
+5. Concorrência (contexto, não vira dimensão de nota)
+6. Decisor (quem decide, quem influencia)
+7. Localização (estados de atuação, aderência ao SNE)
+8. Fechamento com escassez (agenda reforçando agenda concorrida do especialista)
+
+DIMENSÕES DE NOTA — escala 1 a 5 (5 = melhor, 1 = reservado pra casos muito
+fracos). Deixar null quando a dimensão não se aplicou à call. NÃO existe
+dimensão de Concorrência (comentar em texto livre se aparecer, não pontuar):
+
+1. Abertura & Contexto (passos 1-2) — quebra-gelo + segmento/tipo de frota sem
+   parecer interrogatório.
+2. Qualificação de Frota (passos 3 e 7) — placas, PJ/PF, estados, SNE.
+3. Qualificação da Dor (passo 4) — volume/valor de multa e motivo real do
+   contato.
+4. Decisor (passo 6) — identificou Decisor vs. Influenciador forte/fraco.
+5. Fechamento com Escassez (passo 8) — usou a escassez do especialista ao
+   marcar.
+
+REGRAS DE DESQUALIFICAÇÃO A REAVALIAR:
+- Corte de placas: ≤10 placas = desqualificado direto (comum no Inbound).
+- PF x PJ: frota 100% PF é sem fit por padrão (solução é pra CNPJ) — avaliar
+  mesmo assim se for frota mista ou 100% PF mas grande.
+
+Para cada call, classifique em uma categoria:
+- "Agendamento confirmado"
+- "Qualificado sem próximo passo" (sempre prioridade, nunca detalhe secundário)
+- "Desqualificação" (aplicar as regras acima)
+- "Outro"
+`.trim();
+
+// ---------------------------------------------------------------------------
+// SALESBUD: TOKEN + FETCH
+// ---------------------------------------------------------------------------
+
+let cachedToken = null;
+let tokenExpiresAt = 0;
+
+async function getSalesbudToken() {
+  if (cachedToken && Date.now() < tokenExpiresAt - 60_000) return cachedToken;
+
+  const resp = await fetch("https://api.salesbud.com.br/oauth/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "client_credentials",
+      client_id: SALESBUD_CLIENT_ID,
+      client_secret: SALESBUD_CLIENT_SECRET,
+    }),
   });
-  return google.drive({ version: 'v3', auth });
+  if (!resp.ok) {
+    throw new Error(`[PV] Falha ao obter token Salesbud: ${resp.status} ${await resp.text()}`);
+  }
+  const data = await resp.json();
+  cachedToken = data.access_token;
+  tokenExpiresAt = Date.now() + data.expires_in * 1000;
+  console.log(`[PV] Token Salesbud renovado. Escopo: ${data.scope}`);
+  return cachedToken;
 }
 
-function getSheetsClient() {
-  const auth = new google.auth.GoogleAuth({
-    credentials: JSON.parse(process.env.GOOGLE_CREDENTIALS),
-    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+async function salesbudGet(path, params, retrying = false) {
+  const token = await getSalesbudToken();
+  const url = new URL(`https://api.salesbud.com.br${path}`);
+  Object.entries(params || {}).forEach(([k, v]) => {
+    if (v !== undefined && v !== null) url.searchParams.set(k, v);
   });
-  return google.sheets({ version: 'v4', auth });
+
+  const resp = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+
+  if (resp.status === 401 && !retrying) {
+    // token pode ter sido revogado antes do expires_in — força renovação e tenta 1x
+    cachedToken = null;
+    return salesbudGet(path, params, true);
+  }
+  if (!resp.ok) {
+    throw new Error(`[PV] Erro Salesbud ${path}: ${resp.status} ${await resp.text()}`);
+  }
+  return resp.json();
 }
 
-// ─── Dedup via aba própria na planilha (evita depender de Drive/marker
-// files do outro pipeline). Uma linha por chave processada com sucesso.
-async function jaProcessado(chave) {
-  const sheets = getSheetsClient();
-  try {
-    const res = await sheets.spreadsheets.values.get({
-      spreadsheetId: process.env.SPREADSHEET_ID,
-      range: `${MARCADORES_ABA}!A:A`,
+// Busca todas as calls de um owner_email dentro da janela, paginando até has_more=false.
+// Ordenação padrão da API é ascendente por meeting_at — confirmado empiricamente.
+async function listCallsInWindow(ownerEmail, meetingAfterISO, meetingBeforeISO) {
+  const all = [];
+  let cursor = null;
+  do {
+    const page = await salesbudGet("/v1/calls", {
+      owner_email: ownerEmail,
+      meeting_after: meetingAfterISO,
+      meeting_before: meetingBeforeISO,
+      limit: 50,
+      cursor: cursor || undefined,
     });
-    const linhas = (res.data.values || []).flat();
-    return linhas.includes(chave);
-  } catch (e) {
-    console.error('[PV] Erro ao checar marcador (seguindo como não processado):', e.message);
-    return false;
+    all.push(...page.data);
+    cursor = page.pagination.has_more ? page.pagination.next_cursor : null;
+  } while (cursor);
+  return all;
+}
+
+async function getTranscript(callId) {
+  const t = await salesbudGet(`/v1/calls/${callId}/transcript`, {});
+  return t.data;
+}
+
+// ---------------------------------------------------------------------------
+// JANELA DE DATAS: quarta 00:00 -> quarta 00:00 (America/Sao_Paulo), 7 dias fechados
+// ---------------------------------------------------------------------------
+
+function computeWeekWindow(now = new Date()) {
+  // America/Sao_Paulo não observa horário de verão desde 2019 -> UTC-3 fixo.
+  const OFFSET_HOURS = 3;
+  const nowSP = new Date(now.getTime() - OFFSET_HOURS * 3600 * 1000);
+  const midnightSP = new Date(Date.UTC(nowSP.getUTCFullYear(), nowSP.getUTCMonth(), nowSP.getUTCDate()));
+  // meeting_before = hoje 00:00 em SP, convertido de volta pra UTC
+  const windowEndUTC = new Date(midnightSP.getTime() + OFFSET_HOURS * 3600 * 1000);
+  const windowStartUTC = new Date(windowEndUTC.getTime() - 7 * 24 * 3600 * 1000);
+  return {
+    meeting_after: windowStartUTC.toISOString(),
+    meeting_before: windowEndUTC.toISOString(),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// CLAUDE: SCORING POR PESSOA + SÍNTESE DA EQUIPE
+// ---------------------------------------------------------------------------
+
+async function callClaude(system, userText, maxTokens = 4000) {
+  const resp = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-api-key": ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: CLAUDE_MODEL,
+      max_tokens: maxTokens,
+      system,
+      messages: [{ role: "user", content: userText }],
+    }),
+  });
+  if (!resp.ok) {
+    throw new Error(`[PV] Erro Claude API: ${resp.status} ${await resp.text()}`);
+  }
+  const data = await resp.json();
+  return data.content.map((b) => (b.type === "text" ? b.text : "")).join("\n");
+}
+
+function formatUtterances(transcript) {
+  if (!transcript || !transcript.utterances) return "(transcrição indisponível)";
+  return transcript.utterances.map((u) => `${u.speaker}: ${u.text}`).join("\n");
+}
+
+async function scoreRepWeek(rep, calls, transcriptsById) {
+  const rubric = rep.team === "Outbound" ? OUTBOUND_RUBRIC : INBOUND_RUBRIC;
+
+  const callsBlock = calls
+    .map((c, i) => {
+      const tr = transcriptsById[c.id];
+      return `
+### Call ${i + 1} (id: ${c.id})
+Título: ${c.title}
+Data/hora: ${c.meeting_at}
+Duração: ${c.duration_seconds}s
+Status: ${c.status} | No-show: ${c.no_show}
+
+Transcrição (${rep.name} é um dos dois falantes — identifique pelo conteúdo,
+não pela letra A/B, que não é fixa):
+${formatUtterances(tr)}
+`.trim();
+    })
+    .join("\n\n---\n\n");
+
+  const system = `Você é o Bruno Mol, Head of Sales da Frota162, avaliando calls de pré-vendas do time ${rep.team} pelo rubric oficial da empresa. Use SOMENTE o rubric abaixo — nunca invente dimensão nova, nunca use rubric de AE (Abertura/Dor/ROI/Negociação/Fechamento de venda são de call de fechamento, não se aplicam aqui).
+
+${rubric}
+
+Para CADA call, produza: categoria, nota por dimensão (ou null se não se aplicou), uma "Observação" (o que aconteceu, factual) e uma "Sugestão de Ação" (estratégica, específica da Frota162, aplicável pelo próprio pré-vendas sem precisar do Bruno). Seja direto e crítico — este material vai ser usado numa call de treino, não é elogio.`;
+
+  const userText = `Pré-vendas: ${rep.name} (${rep.team})
+Calls da semana (${calls.length} no total):
+
+${callsBlock}
+
+Responda em markdown, com uma tabela de pontuação (uma linha por call) e, antes
+da tabela, as 2-3 observações mais importantes da semana pra esse pré-vendas
+(priorize sempre "Qualificado sem próximo passo" quando existir).`;
+
+  return callClaude(system, userText, 6000);
+}
+
+async function synthesizeTeam(teamName, repSummaries) {
+  const system = `Você escreve o resumo executivo semanal de pré-vendas da Frota162 pro Bruno Mol (Head of Sales), pra ele usar na call de treino de quinta-feira com o time ${teamName}. Seja direto, sem preâmbulo, sem elogio genérico. Priorize sempre: (1) calls qualificadas sem próximo passo, (2) padrão que se repete entre mais de uma pessoa, (3) 1-2 ações concretas pra pauta de treino. Formato Slack (mrkdwn): *negrito* com asterisco simples, não markdown de cabeçalho.`;
+
+  const userText = `Análises individuais da semana, time ${teamName}:\n\n${repSummaries
+    .map((r) => `## ${r.name}\n${r.summary}`)
+    .join("\n\n")}\n\nEscreva a síntese executiva do time ${teamName} pro Slack — máximo ~250 palavras.`;
+
+  return callClaude(system, userText, 1500);
+}
+
+// ---------------------------------------------------------------------------
+// SLACK
+// ---------------------------------------------------------------------------
+
+async function sendSlackDM(text) {
+  if (!SLACK_WEBHOOK_URL) {
+    console.warn("[PV] PV_SLACK_DM_WEBHOOK_URL não configurado — pulando envio.");
+    return;
+  }
+  const resp = await fetch(SLACK_WEBHOOK_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text }),
+  });
+  if (!resp.ok) {
+    throw new Error(`[PV] Erro ao postar no Slack: ${resp.status} ${await resp.text()}`);
   }
 }
 
-async function marcarProcessado(chave) {
-  const sheets = getSheetsClient();
-  await sheets.spreadsheets.values.append({
-    spreadsheetId: process.env.SPREADSHEET_ID,
-    range: `${MARCADORES_ABA}!A1`,
-    valueInputOption: 'USER_ENTERED',
-    insertDataOption: 'INSERT_ROWS',
-    requestBody: { values: [[chave, new Date().toISOString()]] },
-  });
-}
+// ---------------------------------------------------------------------------
+// PIPELINE PRINCIPAL
+// ---------------------------------------------------------------------------
 
-// ─── Eventos crus: 1 linha por Ligação ou WhatsApp ──────────────────
-// Colunas: dataISO | userId | nome | canal | tituloOuChat | duracaoSeg | telefoneOuChat | texto | contextoJSON
-async function salvarEvento(linha) {
-  const sheets = getSheetsClient();
-  await sheets.spreadsheets.values.append({
-    spreadsheetId: process.env.SPREADSHEET_ID,
-    range: `${EVENTOS_ABA}!A1`,
-    valueInputOption: 'USER_ENTERED',
-    insertDataOption: 'INSERT_ROWS',
-    requestBody: { values: [linha] },
-  });
-}
+async function rodarCicloSemanal() {
+  const { meeting_after, meeting_before } = computeWeekWindow();
+  console.log(`[PV] Janela: ${meeting_after} -> ${meeting_before}`);
 
-async function lerEventosDaSemana(inicioISO, fimISO) {
-  const sheets = getSheetsClient();
-  const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: process.env.SPREADSHEET_ID,
-    range: `${EVENTOS_ABA}!A2:I`,
-  });
-  const linhas = res.data.values || [];
-  return linhas.filter(l => l[0] >= inicioISO && l[0] <= fimISO);
-}
+  const outboundSummaries = [];
+  const inboundSummaries = [];
+  let totalCalls = 0;
 
-// ─── HTML → texto plano (a Salesbud manda transcription em HTML) ────
-function stripHtml(html) {
-  if (!html) return '';
-  return html
-    .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<\/p>/gi, '\n')
-    .replace(/<[^>]+>/g, '')
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
-}
+  for (const rep of REPS) {
+    console.log(`[PV] Buscando calls de ${rep.name}...`);
+    const calls = await listCallsInWindow(rep.email, meeting_after, meeting_before);
+    const completed = calls.filter((c) => c.status === "completed" && !c.no_show);
+    totalCalls += completed.length;
 
-// ─── Verificação de assinatura — best effort, mesmo padrão do pipeline
-// existente: se não houver secret configurado, aceita sem verificar.
-function verificarAssinatura(req, rawBody) {
-  const secret = process.env.SALESBUD_WEBHOOK_SECRET;
-  if (!secret) return { ok: true, motivo: 'sem secret configurado' };
-  const candidatos = ['x-salesbud-signature', 'x-signature', 'x-webhook-signature'];
-  let header = null, valor = null;
-  for (const h of candidatos) { if (req.headers[h]) { header = h; valor = req.headers[h]; break; } }
-  if (!header) {
-    console.log('[PV] Nenhum header de assinatura reconhecido. Headers:', JSON.stringify(req.headers));
-    return { ok: true, motivo: 'header não encontrado — aceito temporariamente' };
-  }
-  const hash = crypto.createHmac('sha256', secret).update(rawBody).digest('hex');
-  const valido = hash === String(valor).replace(/^sha256=/, '');
-  return { ok: valido, motivo: valido ? 'ok' : 'assinatura inválida' };
-}
-
-function postSlack(msg, webhookUrl) {
-  return new Promise((resolve, reject) => {
-    const body = JSON.stringify({ text: msg });
-    const url = new URL(webhookUrl || process.env.PV_SLACK_WEBHOOK_URL);
-    const req = https.request({
-      hostname: url.hostname, path: url.pathname + url.search, method: 'POST',
-      headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) },
-    }, (res) => {
-      let data = '';
-      res.on('data', c => data += c);
-      res.on('end', () => {
-        if (res.statusCode >= 200 && res.statusCode < 300) resolve();
-        else reject(new Error(`Slack respondeu ${res.statusCode}: ${data.slice(0, 200)}`));
-      });
-    });
-    req.on('error', reject);
-    req.setTimeout(15000, () => { req.destroy(); reject(new Error('Slack timeout')); });
-    req.write(body); req.end();
-  });
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// WEBHOOK — captura Ligação (VoIP) e WhatsApp dos pré-vendas
-// ═══════════════════════════════════════════════════════════════════════
-app.post('/webhook/salesbud-prevendas', (req, res) => {
-  res.json({ ok: true, status: 'processing' });
-
-  (async () => {
-    try {
-      const rawBody = typeof req.body === 'string' ? req.body : JSON.stringify(req.body);
-      const verificacao = verificarAssinatura(req, rawBody);
-      if (!verificacao.ok) { console.log('[PV] Webhook rejeitado -', verificacao.motivo); return; }
-
-      const payload = JSON.parse(rawBody);
-      const userId = String(payload.userId || '');
-
-      console.log(`[PV] RECEBIDO — userId:${userId} id:${payload.id || payload.chatId} tipo:${payload.recordProvider || (payload.chatJid ? 'whatsapp' : 'reuniao')}`);
-
-      const nome = PRE_VENDAS_USER_MAP[userId];
-      if (!nome) { console.log('[PV] userId não é pré-vendas mapeado, ignorando:', userId); return; }
-
-      let canal, chave, dataISO, tituloOuChat, duracaoSeg, telefoneOuChat, texto, contextoJSON;
-
-      if (payload.chatJid !== undefined) {
-        // Payload WhatsApp (doc Salesbud: chatJid, messagesText, messageDate)
-        canal = 'whatsapp';
-        chave = `pv_wpp_${payload.chatId}_${payload.messageDate}`;
-        dataISO = payload.messageDate || '';
-        tituloOuChat = payload.chatName || '';
-        duracaoSeg = 0;
-        telefoneOuChat = (payload.phoneNumbers || []).join(', ');
-        texto = payload.messagesText || '';
-        contextoJSON = JSON.stringify({ clientMessagesText: payload.clientMessagesText || '', isGroup: !!payload.isGroup });
-      } else if (payload.recordProvider === 'VOIP' || payload.phoneNumber !== undefined) {
-        // Payload VoIP (doc Salesbud: phoneNumber, recordProvider, meetingAt)
-        canal = 'ligacao';
-        chave = `pv_call_${payload.id}`;
-        dataISO = (payload.meetingAt || '').slice(0, 10);
-        tituloOuChat = payload.title || '';
-        duracaoSeg = payload.duration || 0;
-        telefoneOuChat = payload.phoneNumber || '';
-        texto = stripHtml(payload.transcription || '');
-        contextoJSON = JSON.stringify(payload.context || {});
-      } else {
-        console.log('[PV] Payload não é Ligação nem WhatsApp (provavelmente Reunião), ignorando.');
-        return;
-      }
-
-      if (!texto || texto.length < 20) { console.log('[PV] Texto vazio/curto demais, ignorando:', chave); return; }
-      if (!dataISO) { console.log('[PV] Sem data, ignorando:', chave); return; }
-
-      if (await jaProcessado(chave)) { console.log('[PV] Já capturado, pulando:', chave); return; }
-
-      await salvarEvento([dataISO, userId, nome, canal, tituloOuChat, duracaoSeg, telefoneOuChat, texto, contextoJSON]);
-      await marcarProcessado(chave);
-      console.log(`[PV] CAPTURADO — nome:${nome} canal:${canal} data:${dataISO} tamanho_texto:${texto.length}`);
-
-    } catch (err) {
-      console.error('[PV] Erro na captura:', err.message);
+    if (completed.length === 0) {
+      const bucket = rep.team === "Outbound" ? outboundSummaries : inboundSummaries;
+      bucket.push({ name: rep.name, summary: "Nenhuma call completa registrada nesta semana." });
+      continue;
     }
-  })();
-});
 
-// ═══════════════════════════════════════════════════════════════════════
-// CLAUDE — pontuação por rubric (NUNCA usa analytics.score da Salesbud)
-// ═══════════════════════════════════════════════════════════════════════
-function pvMontarSystemPrompt(perfil, canal) {
-  const dims = perfil === 'Outbound' ? RUBRIC_OUTBOUND : RUBRIC_INBOUND;
-  const nomeCanal = canal === 'ligacao' ? 'ligações telefônicas' : 'conversas de WhatsApp';
-  return `Você aplica o rubric de coaching de pré-vendas da Frota162 (skill pre-vendas-coach) sobre transcrições de ${nomeCanal}.
-Perfil do pré-vendas: ${perfil}. Dimensões a pontuar, escala 1 a 10 (nunca 1 a 5): ${dims.join(', ')}.
-IMPORTANTE: você recebe apenas o texto da conversa. NUNCA existe nota pré-calculada de nenhum fornecedor — toda pontuação é sua, com base no conteúdo real.
-Para cada interação fornecida (separadas por "---"), avalie se foi "efetiva" (chegou em responsável certo com dado real de frota/dor capturado) ou não.
-Identifique a melhor interação do canal nesta semana: contato, resumo do que foi qualificado, se fechou com dia/hora específicos.
-Identifique até 3 prioridades de coaching (pontos fortes a reforçar ou fracos a corrigir), sempre citando o contato/exemplo real.
-Identifique achados operacionais: mesmo contato discado várias vezes sem sucesso, transcrição cortada antes do fim, reclamação do contato sobre origem/abordagem, etc. Só inclua se houver evidência real no texto.
-Retorne SOMENTE JSON válido, sem markdown, sem texto fora do JSON, neste formato exato:
-{"total":0,"efetivas":0,"dimensoes":{${dims.map(d => `"${d}":0`).join(',')}},"melhor_interacao":{"contato":"","resumo":"","fechou":false},"prioridades":["",""],"achados_operacionais":[]}`;
-}
-
-function pvChamarClaude(systemPrompt, conteudo) {
-  return new Promise((resolve, reject) => {
-    const body = JSON.stringify({
-      model: 'claude-sonnet-4-5',
-      max_tokens: 3000,
-      system: systemPrompt,
-      messages: [{ role: 'user', content: conteudo }],
-    });
-    const req = https.request({
-      hostname: 'api.anthropic.com', path: '/v1/messages', method: 'POST',
-      headers: {
-        'x-api-key': process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01',
-        'content-type': 'application/json',
-        'content-length': Buffer.byteLength(body),
-      },
-    }, (res) => {
-      let data = '';
-      res.on('data', c => data += c);
-      res.on('end', () => {
+    console.log(`[PV] ${rep.name}: ${completed.length} calls completas. Buscando transcrições...`);
+    const transcriptsById = {};
+    for (const c of completed) {
+      if (c.transcript && c.transcript.available) {
         try {
-          const p = JSON.parse(data);
-          if (p.type === 'error' || !p.content || !p.content[0]) {
-            return reject(new Error('Claude API error: ' + (p.error?.message || JSON.stringify(p).slice(0, 200))));
-          }
-          const t = p.content[0].text.replace(/```json/gi, '').replace(/```/g, '').trim();
-          resolve(JSON.parse(t));
-        } catch (e) { reject(new Error('Claude parse: ' + e.message)); }
-      });
-    });
-    req.on('error', reject);
-    req.setTimeout(180000, () => { req.destroy(); reject(new Error('Claude timeout')); });
-    req.write(body); req.end();
-  });
-}
-
-async function pvAnalisarCanal(perfil, canal, eventos) {
-  const vazio = () => ({ total: 0, efetivas: 0, dimensoes: {}, melhor_interacao: null, prioridades: [], achados_operacionais: [] });
-  if (!eventos.length) return vazio();
-
-  const conteudo = eventos.map(e => `--- ${e[4] || '(sem título)'} (${e[0]}, ${e[5]}s) ---\n${e[7]}`).join('\n\n');
-  const systemPrompt = pvMontarSystemPrompt(perfil, canal);
-
-  let lastErr;
-  for (let tentativa = 1; tentativa <= 3; tentativa++) {
-    try {
-      const r = await pvChamarClaude(systemPrompt, conteudo);
-      r.total = r.total || eventos.length; // garante consistência mesmo se o Claude não contar certo
-      return r;
-    } catch (e) {
-      lastErr = e;
-      console.log(`[PV] pvAnalisarCanal tentativa ${tentativa} falhou (${perfil}/${canal}):`, e.message);
-      if (tentativa < 3) await new Promise(r => setTimeout(r, 5000 * tentativa));
-    }
-  }
-  console.error('[PV] Falhou após 3 tentativas, retornando vazio:', lastErr?.message);
-  return vazio();
-}
-
-// ─── Consolidado ponderado pelo volume de cada canal ─────────────────
-function pvConsolidar(dims) {
-  const listas = dims.filter(d => d && d.n > 0);
-  if (!listas.length) return {};
-  const todasChaves = new Set();
-  listas.forEach(l => Object.keys(l.valores).forEach(k => todasChaves.add(k)));
-  const out = {};
-  for (const chave of todasChaves) {
-    let somaPeso = 0, somaPonderada = 0;
-    for (const l of listas) {
-      if (l.valores[chave] != null) { somaPonderada += l.valores[chave] * l.n; somaPeso += l.n; }
-    }
-    out[chave] = somaPeso > 0 ? (somaPonderada / somaPeso).toFixed(1) : '—';
-  }
-  return out;
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// HTML — separado por canal (Ligação / WhatsApp) + consolidado final
-// CSS idêntico ao usado nos relatórios manuais do Ciclo 6, pra manter
-// identidade visual entre o que é feito manualmente e o automático.
-// ═══════════════════════════════════════════════════════════════════════
-const CSS_BASE = `
-@import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700;800&display=swap');
-:root{--laranja:#E8401C;--dark:#1A1A1A;--bg:#F7F5F3;--cinza:#6b6b6b;--verde:#2e7d32;--linha:#e3ded9;}
-*{box-sizing:border-box;margin:0;padding:0;}
-body{font-family:'Montserrat',sans-serif;background:var(--bg);color:var(--dark);line-height:1.5;padding:32px 18px;}
-.wrap{max-width:960px;margin:0 auto;}
-header{border-left:6px solid var(--laranja);padding:6px 0 6px 18px;margin-bottom:8px;}
-header h1{font-size:26px;font-weight:800;}
-header .sub{color:var(--cinza);font-weight:500;font-size:13px;margin-top:2px;}
-.fonte{font-size:11px;color:var(--cinza);margin:10px 0 24px 18px;}
-.canal-header{background:var(--dark);color:#fff;padding:10px 18px;border-radius:8px 8px 0 0;font-size:14px;font-weight:800;text-transform:uppercase;letter-spacing:.5px;margin-top:34px;}
-.canal-header.wpp{background:#2e7d32;}
-h2{font-size:16px;font-weight:800;text-transform:uppercase;letter-spacing:.5px;margin:20px 0 12px;padding-bottom:6px;border-bottom:2px solid var(--linha);}
-.kpis{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;}
-.kpi{background:#fff;border:1px solid var(--linha);border-radius:10px;padding:14px 16px;}
-.kpi .n{font-size:24px;font-weight:800;color:var(--laranja);}
-.kpi .l{font-size:11px;color:var(--cinza);font-weight:600;text-transform:uppercase;}
-.medias{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px;}
-.med{background:#fff;border:1px solid var(--linha);border-radius:8px;padding:8px 12px;font-size:13px;font-weight:600;}
-.med span{color:var(--laranja);font-weight:800;}
-.med.consolidado span{color:var(--verde);}
-.prio{background:#fff;border:1px solid var(--linha);border-left:5px solid var(--laranja);border-radius:8px;padding:14px 18px;margin-bottom:10px;}
-.prio p{font-size:14px;margin-bottom:8px;}
-.prio b{color:var(--laranja);}
-.aviso{background:#fff4e5;border:1px solid #f0d9a8;border-radius:8px;padding:12px 16px;font-size:12.5px;color:#7a5a12;margin-bottom:14px;}
-.aviso b{color:#b8860b;}
-.melhor{background:#eaf6ea;border:1px solid #bfe3bf;border-radius:8px;padding:12px 16px;font-size:13px;margin-bottom:14px;}
-.tag{display:inline-block;font-size:10px;font-weight:700;padding:2px 7px;border-radius:20px;text-transform:uppercase;background:#e6f4ea;color:var(--verde);}
-footer{margin-top:34px;padding-top:14px;border-top:2px solid var(--linha);font-size:11px;color:var(--cinza);}
-footer b{color:var(--laranja);}
-.gerado-auto{font-size:10px;color:var(--cinza);font-style:italic;margin-top:4px;}
-`;
-
-function pvRenderCanalSecao(titulo, classe, dims, r) {
-  const medPontos = Object.entries(r.dimensoes || {}).map(([k, v]) =>
-    `<div class="med">${k} <span>${v}</span></div>`).join('');
-  const prioridades = (r.prioridades || []).map(p => `<p>${p}</p>`).join('');
-  const achados = (r.achados_operacionais || []).length
-    ? `<div class="aviso"><b>Achados operacionais</b>${r.achados_operacionais.map(a => `<p>${a}</p>`).join('')}</div>` : '';
-  const melhor = r.melhor_interacao
-    ? `<div class="melhor"><b>${r.melhor_interacao.contato || 'Contato não identificado'}</b> — ${r.melhor_interacao.resumo || ''} ${r.melhor_interacao.fechou ? '<span class="tag">Fechou</span>' : ''}</div>`
-    : '<p style="font-size:12px;color:var(--cinza);">Sem interação de destaque nesta semana.</p>';
-
-  return `
-<div class="canal-header ${classe}">${titulo}</div>
-<div class="kpis">
-  <div class="kpi"><div class="n">${r.total || 0}</div><div class="l">Interações</div></div>
-  <div class="kpi"><div class="n">${r.efetivas || 0}</div><div class="l">Efetivas</div></div>
-</div>
-<div class="medias">${medPontos || '<span style="font-size:12px;color:var(--cinza);">Sem dado suficiente</span>'}</div>
-<h2>Melhor interação</h2>
-${melhor}
-${prioridades ? `<h2>Prioridades</h2><div class="prio">${prioridades}</div>` : ''}
-${achados}
-`;
-}
-
-function pvGerarHTML(nome, perfil, semanaIni, semanaFim, resLig, resWpp) {
-  const consolidado = pvConsolidar([
-    { n: resLig.total || 0, valores: resLig.dimensoes || {} },
-    { n: resWpp.total || 0, valores: resWpp.dimensoes || {} },
-  ]);
-  const medConsolidado = Object.entries(consolidado).map(([k, v]) =>
-    `<div class="med consolidado">${k} <span>${v}</span></div>`).join('');
-
-  return `<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8"><title>Autogestão — ${nome} — ${semanaFim}</title>
-<style>${CSS_BASE}</style></head>
-<body><div class="wrap">
-<header><h1>Autogestão Pré-Vendas · ${nome}</h1><div class="sub">Perfil ${perfil} · Semana ${semanaIni}–${semanaFim}</div></header>
-<div class="fonte">Base: eventos capturados via webhook Salesbud (Ligação + WhatsApp). Pontuação sempre calculada pelo rubric Frota162 via Claude — nunca a nota nativa da Salesbud.</div>
-${pvRenderCanalSecao('Ligações', '', RUBRIC_OUTBOUND, resLig)}
-${pvRenderCanalSecao('WhatsApp', 'wpp', RUBRIC_OUTBOUND, resWpp)}
-<h2>Consolidado da semana</h2>
-<div class="medias">${medConsolidado || '<span style="font-size:12px;color:var(--cinza);">Sem dado suficiente em nenhum canal</span>'}</div>
-<footer>Autogestão Pré-Vendas — <b>Frota162</b> · ${semanaIni}–${semanaFim}<div class="gerado-auto">Gerado automaticamente — verificar antes de tratar como definitivo nas primeiras semanas.</div></footer>
-</div></body></html>`;
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// CRON — segunda de manhã, agrega a semana anterior por pessoa e canal
-// ═══════════════════════════════════════════════════════════════════════
-app.post('/cron/pre-vendas-semanal', (req, res) => {
-  res.json({ ok: true, status: 'processing' });
-
-  (async () => {
-    try {
-      const hoje = new Date();
-      const diasDesdeSegunda = (hoje.getDay() + 6) % 7;
-      const segundaAtual = new Date(hoje); segundaAtual.setDate(hoje.getDate() - diasDesdeSegunda);
-      const segundaPassada = new Date(segundaAtual); segundaPassada.setDate(segundaAtual.getDate() - 7);
-      const sextaPassada = new Date(segundaPassada); sextaPassada.setDate(segundaPassada.getDate() + 4);
-      const inicioISO = segundaPassada.toISOString().slice(0, 10);
-      const fimISO = sextaPassada.toISOString().slice(0, 10);
-
-      console.log(`[PV] Cron semanal iniciado — janela ${inicioISO} a ${fimISO}`);
-
-      const eventos = await lerEventosDaSemana(inicioISO, fimISO);
-      const drive = getDriveClient();
-      const mencoes = [];
-
-      for (const nome of Object.keys(PRE_VENDAS_PERFIL)) {
-        const perfil = PRE_VENDAS_PERFIL[nome];
-        const doNome = eventos.filter(e => e[2] === nome);
-        const ligacoes = doNome.filter(e => e[3] === 'ligacao');
-        const whatsapps = doNome.filter(e => e[3] === 'whatsapp');
-
-        console.log(`[PV] ${nome}: ${ligacoes.length} ligações, ${whatsapps.length} whatsapps na semana`);
-
-        const [resLig, resWpp] = await Promise.all([
-          pvAnalisarCanal(perfil, 'ligacao', ligacoes),
-          pvAnalisarCanal(perfil, 'whatsapp', whatsapps),
-        ]);
-
-        const html = pvGerarHTML(nome, perfil, inicioISO, fimISO, resLig, resWpp);
-        const nomeArq = `${fimISO} | ${nome} (auto).html`;
-
-        const uploaded = await drive.files.create({
-          supportsAllDrives: true,
-          requestBody: { name: nomeArq, parents: [PRE_VENDAS_FOLDER_ID[nome]], mimeType: 'text/html' },
-          media: { mimeType: 'text/html', body: html },
-          fields: 'id,webViewLink',
-        });
-        await drive.permissions.create({ fileId: uploaded.data.id, supportsAllDrives: true, requestBody: { role: 'writer', type: 'anyone' } });
-
-        mencoes.push(`• <@${PRE_VENDAS_SLACK_ID[nome]}> ${nome}: <https://drive.google.com/drive/folders/${PRE_VENDAS_FOLDER_ID[nome]}|pasta>`);
+          transcriptsById[c.id] = await getTranscript(c.id);
+        } catch (e) {
+          console.error(`[PV] Falha ao buscar transcrição de ${c.id}:`, e.message);
+        }
       }
-
-      await postSlack(`📊 *Autogestão Pré-Vendas — ciclo automático (${inicioISO}–${fimISO})*\n\n${mencoes.join('\n')}\n\n_Gerado automaticamente. Verifique com atenção nas primeiras semanas._`);
-      console.log('[PV] Cron semanal concluído com sucesso.');
-
-    } catch (err) {
-      console.error('[PV] Erro no cron semanal:', err.message);
-      await postSlack(`:warning: Falha no ciclo automático de pré-vendas: ${err.message}`).catch(() => {});
     }
-  })();
+
+    console.log(`[PV] ${rep.name}: pontuando com Claude...`);
+    const summary = await scoreRepWeek(rep, completed, transcriptsById);
+    const bucket = rep.team === "Outbound" ? outboundSummaries : inboundSummaries;
+    bucket.push({ name: rep.name, summary });
+  }
+
+  console.log("[PV] Gerando síntese executiva por time...");
+  const outboundSynthesis = await synthesizeTeam("Outbound", outboundSummaries);
+  const inboundSynthesis = await synthesizeTeam("Inbound", inboundSummaries);
+
+  const dataInicio = new Date(meeting_after).toLocaleDateString("pt-BR", { timeZone: TIMEZONE });
+  const dataFim = new Date(new Date(meeting_before).getTime() - 1).toLocaleDateString("pt-BR", { timeZone: TIMEZONE });
+
+  const mensagem = `*Resumo semanal Pré-Vendas — ${dataInicio} a ${dataFim}* (${totalCalls} calls analisadas)
+
+*OUTBOUND*
+${outboundSynthesis}
+
+*INBOUND*
+${inboundSynthesis}
+
+_Análise individual completa de cada pré-vendas disponível sob pedido — este é o resumo pra pauta de treino de quinta._`;
+
+  await sendSlackDM(mensagem);
+  console.log("[PV] Ciclo semanal concluído com sucesso.");
+}
+
+// ---------------------------------------------------------------------------
+// ROTAS
+// ---------------------------------------------------------------------------
+
+app.get("/", (req, res) => res.json({ status: "ok", service: "frota162-prevendas-v2" }));
+
+app.post("/cron/pre-vendas-semanal", async (req, res) => {
+  // responde rápido pro cron-job.org não dar timeout, roda o pipeline em background
+  res.json({ status: "iniciado" });
+  try {
+    await rodarCicloSemanal();
+  } catch (e) {
+    console.error("[PV] Erro no ciclo semanal:", e);
+  }
 });
 
-app.get('/', (req, res) => res.json({ status: 'ok', service: 'Frota162 Pré-Vendas Auto v1' }));
+// endpoint auxiliar pra testar sem esperar quarta-feira
+app.get("/debug/janela", (req, res) => res.json(computeWeekWindow()));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Frota162 Pré-Vendas Auto rodando na porta ${PORT}`));
+app.listen(PORT, () => console.log(`[PV] Servidor rodando na porta ${PORT}`));
