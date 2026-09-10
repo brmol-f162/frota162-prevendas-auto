@@ -152,7 +152,26 @@ async function getSalesbudToken() {
   return cachedToken;
 }
 
-async function salesbudGet(path, params, retrying = false) {
+// Rate limit da Salesbud: 120 req/min (confirmado via /v1/context). Um pré-vendas
+// com 25+ calls na semana já estoura isso se buscarmos transcrição sem pausa —
+// foi exatamente o que aconteceu no primeiro teste real. Dois mecanismos:
+// (1) espaçamento mínimo entre requisições (gate global), (2) retry com backoff
+// em cima de 429, respeitando Retry-After quando vier.
+const MIN_INTERVAL_MS = 600; // ~100 req/min, com folga sob o limite de 120
+let lastRequestAt = 0;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function throttle() {
+  const wait = lastRequestAt + MIN_INTERVAL_MS - Date.now();
+  if (wait > 0) await sleep(wait);
+  lastRequestAt = Date.now();
+}
+
+async function salesbudGet(path, params, attempt = 0) {
+  await throttle();
   const token = await getSalesbudToken();
   const url = new URL(`https://api.salesbud.com.br${path}`);
   Object.entries(params || {}).forEach(([k, v]) => {
@@ -161,11 +180,23 @@ async function salesbudGet(path, params, retrying = false) {
 
   const resp = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
 
-  if (resp.status === 401 && !retrying) {
+  if (resp.status === 401 && attempt === 0) {
     // token pode ter sido revogado antes do expires_in — força renovação e tenta 1x
     cachedToken = null;
-    return salesbudGet(path, params, true);
+    return salesbudGet(path, params, attempt + 1);
   }
+
+  if (resp.status === 429) {
+    if (attempt >= 5) {
+      throw new Error(`[PV] Rate limit persistente em ${path} após ${attempt} tentativas — desistindo.`);
+    }
+    const retryAfterHeader = resp.headers.get("retry-after");
+    const waitMs = retryAfterHeader ? Number(retryAfterHeader) * 1000 : 2000 * Math.pow(2, attempt);
+    console.warn(`[PV] 429 em ${path} — aguardando ${waitMs}ms antes de tentar de novo (tentativa ${attempt + 1}/5).`);
+    await sleep(waitMs);
+    return salesbudGet(path, params, attempt + 1);
+  }
+
   if (!resp.ok) {
     throw new Error(`[PV] Erro Salesbud ${path}: ${resp.status} ${await resp.text()}`);
   }
