@@ -43,8 +43,12 @@ PERFIL: Outbound — Pré-Vendas
 SDR liga proativamente para leads frios/base fria. Objetivo da call: qualificar e
 agendar reunião com o AE (Especialista).
 
-DIMENSÕES DE NOTA (ligações efetivas) — escala 1 a 5 (5 = melhor, 1 = reservado
-pra casos muito fracos):
+DIMENSÕES DE NOTA (ligações efetivas) — escala 1 a 10 (conversão proporcional
+da escala antiga 1-5 × 2): 10 = melhor (antiga 5/A), 8 = antiga 4/B, 6 = antiga
+3/C, 4 = antiga 2/D (pior), 2 = reservado pra casos muito fracos (antiga 1).
+Use números ímpares quando a call ficar entre duas categorias — a escala de 10
+pontos existe justamente pra dar essa resolução mais fina, não pra ficar presa
+só nos múltiplos de 2:
 
 1. Abertura — Chegou no decisor certo e ganhou atenção real nos primeiros
    segundos, sem soar script.
@@ -91,9 +95,12 @@ SCRIPT OFICIAL (8 passos) — usar pra mapear onde a call quebrou:
 7. Localização (estados de atuação, aderência ao SNE)
 8. Fechamento com escassez (agenda reforçando agenda concorrida do especialista)
 
-DIMENSÕES DE NOTA — escala 1 a 5 (5 = melhor, 1 = reservado pra casos muito
-fracos). Deixar null quando a dimensão não se aplicou à call. NÃO existe
-dimensão de Concorrência (comentar em texto livre se aparecer, não pontuar):
+DIMENSÕES DE NOTA — escala 1 a 10 (conversão proporcional da escala antiga
+1-5 × 2): 10 = melhor (antiga 5/A), 8 = antiga 4/B, 6 = antiga 3/C, 4 = antiga
+2/D (pior), 2 = reservado pra casos muito fracos (antiga 1). Use números
+ímpares quando a call ficar entre duas categorias. Deixar null quando a
+dimensão não se aplicou à call. NÃO existe dimensão de Concorrência (comentar
+em texto livre se aparecer, não pontuar):
 
 1. Abertura & Contexto (passos 1-2) — quebra-gelo + segmento/tipo de frota sem
    parecer interrogatório.
@@ -262,28 +269,50 @@ ${formatUtterances(tr)}
 
 ${rubric}
 
-Para CADA call, produza: categoria, nota por dimensão (ou null se não se aplicou), uma "Observação" (o que aconteceu, factual) e uma "Sugestão de Ação" (estratégica, específica da Frota162, aplicável pelo próprio pré-vendas sem precisar do Bruno). Seja direto e crítico — este material vai ser usado numa call de treino, não é elogio.`;
+Para CADA call, produza:
+1. Categoria e nota por dimensão (ou null se não se aplicou).
+2. "Observação" — o que aconteceu, factual.
+3. "Sugestão de Ação" — estratégica, específica da Frota162, aplicável pelo
+   próprio pré-vendas sem precisar do Bruno.
+4. "Frases que Podem Ser Aprimoradas" — para CADA ponto fraco relevante da
+   call (não invente se a call foi limpa), traga:
+   - **Trecho literal**: cite a fala exata do pré-vendas, entre aspas, copiada
+     da transcrição (nunca parafraseie a fala real — se não tiver certeza da
+     frase exata, não cite).
+   - **O que houve de errado**: o que essa fala perdeu ou fez mal (conecte
+     com a dimensão do rubric).
+   - **Frase ideal**: reescreva exatamente o que o pré-vendas deveria ter
+     dito naquele momento daquela call específica (não um exemplo genérico).
+   Sem limite de quantidade — se a call teve 4 momentos ruins, traga os 4;
+   se teve 1, traga só 1.
+
+Seja direto e crítico — este material vai ser usado numa call de treino, não é elogio.`;
 
   const userText = `Pré-vendas: ${rep.name} (${rep.team})
 Calls da semana (${calls.length} no total):
 
 ${callsBlock}
 
-Responda em markdown, com uma tabela de pontuação (uma linha por call) e, antes
-da tabela, as 2-3 observações mais importantes da semana pra esse pré-vendas
-(priorize sempre "Qualificado sem próximo passo" quando existir).`;
+Responda em markdown. Para cada call: cabeçalho com categoria e notas por
+dimensão, "Observação", "Sugestão de Ação", e a seção "Frases que Podem Ser
+Aprimoradas" (trecho literal / o que houve de errado / frase ideal) sempre que
+houver ponto fraco. Antes de tudo, liste as 2-3 observações mais importantes
+da semana pra esse pré-vendas (priorize sempre "Qualificado sem próximo passo"
+quando existir).`;
 
   return callClaude(system, userText, 6000);
 }
 
+// Gera só o CABEÇALHO do time (não substitui o diagnóstico individual, que
+// vai inteiro na mensagem depois, com as citações literais).
 async function synthesizeTeam(teamName, repSummaries) {
-  const system = `Você escreve o resumo executivo semanal de pré-vendas da Frota162 pro Bruno Mol (Head of Sales), pra ele usar na call de treino de quinta-feira com o time ${teamName}. Seja direto, sem preâmbulo, sem elogio genérico. Priorize sempre: (1) calls qualificadas sem próximo passo, (2) padrão que se repete entre mais de uma pessoa, (3) 1-2 ações concretas pra pauta de treino. Formato Slack (mrkdwn): *negrito* com asterisco simples, não markdown de cabeçalho.`;
+  const system = `Você escreve o cabeçalho executivo semanal de pré-vendas da Frota162 pro Bruno Mol (Head of Sales) abrir a call de treino de quinta-feira com o time ${teamName}. Seja direto, sem preâmbulo, sem elogio genérico. Priorize sempre: (1) calls qualificadas sem próximo passo, (2) padrão que se repete entre mais de uma pessoa, (3) 1-2 ações concretas pra pauta de treino. Formato Slack (mrkdwn): *negrito* com asterisco simples, não markdown de cabeçalho (#). Isto é só o topo da mensagem — o diagnóstico individual completo de cada pessoa (com trechos literais) vem logo abaixo, então não repita detalhe de call específica aqui.`;
 
   const userText = `Análises individuais da semana, time ${teamName}:\n\n${repSummaries
     .map((r) => `## ${r.name}\n${r.summary}`)
-    .join("\n\n")}\n\nEscreva a síntese executiva do time ${teamName} pro Slack — máximo ~250 palavras.`;
+    .join("\n\n")}\n\nEscreva só o cabeçalho executivo do time ${teamName} — máximo ~120 palavras.`;
 
-  return callClaude(system, userText, 1500);
+  return callClaude(system, userText, 800);
 }
 
 // ---------------------------------------------------------------------------
@@ -347,22 +376,29 @@ async function rodarCicloSemanal() {
     bucket.push({ name: rep.name, summary });
   }
 
-  console.log("[PV] Gerando síntese executiva por time...");
-  const outboundSynthesis = await synthesizeTeam("Outbound", outboundSummaries);
-  const inboundSynthesis = await synthesizeTeam("Inbound", inboundSummaries);
+  console.log("[PV] Gerando cabeçalho executivo por time...");
+  const outboundHeadline = await synthesizeTeam("Outbound", outboundSummaries);
+  const inboundHeadline = await synthesizeTeam("Inbound", inboundSummaries);
 
   const dataInicio = new Date(meeting_after).toLocaleDateString("pt-BR", { timeZone: TIMEZONE });
   const dataFim = new Date(new Date(meeting_before).getTime() - 1).toLocaleDateString("pt-BR", { timeZone: TIMEZONE });
 
+  // Diagnóstico completo (com trechos literais/antes-depois) vai inteiro na
+  // mensagem — não só a síntese. É isso que sustenta a pauta de treino.
+  function montarBlocoTime(nomeTime, headline, summaries) {
+    const detalhePorPessoa = summaries
+      .map((r) => `*${r.name}*\n${r.summary}`)
+      .join("\n\n" + "-".repeat(20) + "\n\n");
+    return `*${nomeTime.toUpperCase()}*\n${headline}\n\n${detalhePorPessoa}`;
+  }
+
   const mensagem = `*Resumo semanal Pré-Vendas — ${dataInicio} a ${dataFim}* (${totalCalls} calls analisadas)
 
-*OUTBOUND*
-${outboundSynthesis}
+${montarBlocoTime("Outbound", outboundHeadline, outboundSummaries)}
 
-*INBOUND*
-${inboundSynthesis}
+${"=".repeat(30)}
 
-_Análise individual completa de cada pré-vendas disponível sob pedido — este é o resumo pra pauta de treino de quinta._`;
+${montarBlocoTime("Inbound", inboundHeadline, inboundSummaries)}`;
 
   await sendSlackDM(mensagem);
   console.log("[PV] Ciclo semanal concluído com sucesso.");
