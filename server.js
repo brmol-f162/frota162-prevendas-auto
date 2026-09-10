@@ -26,6 +26,7 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const SLACK_WEBHOOK_URL = process.env.PV_SLACK_DM_WEBHOOK_URL; // webhook novo, apontado pra DM do Bruno (não o canal antigo)
 const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-sonnet-4-6";
 const TIMEZONE = "America/Sao_Paulo";
+const BUILD_TAG = "2026-09-10-rate-limit-fix"; // muda a cada versão — dá pra conferir de fora (curl) qual código está live, sem depender de log colado
 
 const REPS = [
   { name: "Vitor Campos", email: "vitor.campos@frota162.com.br", team: "Outbound" },
@@ -439,7 +440,7 @@ ${montarBlocoTime("Inbound", inboundHeadline, inboundSummaries)}`;
 // ROTAS
 // ---------------------------------------------------------------------------
 
-app.get("/", (req, res) => res.json({ status: "ok", service: "frota162-prevendas-v2" }));
+app.get("/", (req, res) => res.json({ status: "ok", service: "frota162-prevendas-v2", build: BUILD_TAG }));
 
 app.post("/cron/pre-vendas-semanal", async (req, res) => {
   // responde rápido pro cron-job.org não dar timeout, roda o pipeline em background
